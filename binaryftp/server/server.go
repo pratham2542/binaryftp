@@ -6,165 +6,213 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync"
 )
 
+type Storage interface {
+	Save(name string, r io.Reader, size uint64) error
+	Get(name string) (io.ReadCloser, uint64, error)
+	List() ([]string, error)
+}
+
 type Server struct {
-	addr     string
-	listener net.Listener
-
-	onUpload   func(filename string, data []byte) error
-	onDownload func(filename string) ([]byte, error)
-	onList     func() ([]string, error)
+	addr    string
+	storage Storage
 }
 
-func New(addr string) *Server {
-	return &Server{addr: addr}
-}
-
-func (s *Server) OnUpload(handler func(filename string, data []byte) error) {
-	s.onUpload = handler
-}
-
-func (s *Server) OnDownload(handler func(filename string) ([]byte, error)) {
-	s.onDownload = handler
-}
-
-func (s *Server) OnList(handler func() ([]string, error)) {
-	s.onList = handler
+func New(addr string, storage Storage) *Server {
+	return &Server{
+		addr:    addr,
+		storage: storage,
+	}
 }
 
 func (s *Server) Start() error {
+
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return err
 	}
-	s.listener = ln
-	log.Println("Server listening on", s.addr)
 
-	var wg sync.WaitGroup
+	log.Println("server listening on", s.addr)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handleConnection(conn)
-		}()
+
+		go s.handleConnection(conn)
 	}
 }
+
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	headerBuf := make([]byte, binary.Size(binarygo.Header{}))
+
 	if _, err := io.ReadFull(conn, headerBuf); err != nil {
+		log.Println("header read error:", err)
 		return
 	}
 
 	header, err := binarygo.ReadHeader(headerBuf)
 	if err != nil {
-		return
-	}
-
-	payload := make([]byte, header.PayloadLen)
-	if _, err := io.ReadFull(conn, payload); err != nil {
+		log.Println("header parse error:", err)
 		return
 	}
 
 	switch header.Command {
+
 	case binarygo.CMD_UPLOAD:
-		s.handleUpload(conn, header, payload)
-	case binarygo.CMD_DOWNLOAD:
-		s.handleDownload(conn, header, payload)
-	case binarygo.CMD_LIST:
-		s.handleList(conn, header)
-	default:
-		sendError(conn, "Unknown command")
-	}
-}
-
-func (s *Server) handleUpload(conn net.Conn, header *binarygo.Header, payload []byte) {
-	up, err := binarygo.ReadUploadPayload(payload)
-	if err != nil {
-		sendError(conn, "Invalid upload payload")
-		return
-	}
-	if s.onUpload != nil {
-		err = s.onUpload(string(up.Filename), up.FileData)
-		if err != nil {
+		if err := s.handleUpload(conn, header); err != nil {
 			sendError(conn, err.Error())
-			return
 		}
+
+	case binarygo.CMD_DOWNLOAD:
+		if err := s.handleDownload(conn, header); err != nil {
+			sendError(conn, err.Error())
+		}
+
+	case binarygo.CMD_LIST:
+		if err := s.handleList(conn, header); err != nil {
+			sendError(conn, err.Error())
+		}
+
+	default:
+		sendError(conn, "unknown command")
 	}
-	sendSuccess(conn, nil)
 }
 
-func (s *Server) handleDownload(conn net.Conn, header *binarygo.Header, payload []byte) {
+func (s *Server) handleUpload(conn net.Conn, header *binarygo.Header) error {
+
+	payload := make([]byte, header.PayloadLen)
+
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return err
+	}
+
+	meta, err := binarygo.ReadUploadPayload(payload)
+	if err != nil {
+		return err
+	}
+
+	reader := io.LimitReader(conn, int64(meta.FileSize))
+
+	err = s.storage.Save(string(meta.Filename), reader, meta.FileSize)
+	if err != nil {
+		return err
+	}
+
+	sendSuccess(conn, nil)
+	return nil
+}
+
+func (s *Server) handleDownload(conn net.Conn, header *binarygo.Header) error {
+
+	payload := make([]byte, header.PayloadLen)
+
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return err
+	}
+
 	dp, err := binarygo.ReadDownloadPayload(payload)
 	if err != nil {
-		sendError(conn, "Invalid download payload")
-		return
-	}
-	if s.onDownload == nil {
-		sendError(conn, "No download handler registered")
-		return
-	}
-	data, err := s.onDownload(string(dp.Filename))
-	if err != nil {
-		sendError(conn, err.Error())
-		return
+		return err
 	}
 
-	up := &binarygo.UploadPayload{
-		FilenameLen: dp.FilenameLen,
-		Filename:    dp.Filename,
-		FileSize:    uint64(len(data)),
-		FileData:    data,
+	reader, size, err := s.storage.Get(string(dp.Filename))
+	if err != nil {
+		return err
 	}
-	bytes, _ := up.ToBytes()
-	sendSuccess(conn, bytes)
+	defer reader.Close()
+
+	filename := string(dp.Filename)
+
+	meta := &binarygo.UploadPayload{
+		FilenameLen: uint16(len(filename)),
+		Filename:    []byte(filename),
+		FileSize:    size,
+	}
+
+	metaBytes, err := meta.ToBytes()
+	if err != nil {
+		return err
+	}
+
+	respHeader := &binarygo.Header{
+		Version:    binarygo.PROTOCOL_VERSION,
+		Command:    0,
+		Status:     binarygo.CMD_SUCCESS,
+		PayloadLen: uint32(len(metaBytes)),
+	}
+
+	hdr, err := respHeader.ToBytes()
+	if err != nil {
+		return err
+	}
+
+	if _, err := conn.Write(hdr); err != nil {
+		return err
+	}
+
+	if _, err := conn.Write(metaBytes); err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(conn, reader); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (s *Server) handleList(conn net.Conn, header *binarygo.Header) {
-	if s.onList == nil {
-		sendError(conn, "No list handler registered")
-		return
-	}
-	names, err := s.onList()
+func (s *Server) handleList(conn net.Conn, header *binarygo.Header) error {
+
+	files, err := s.storage.List()
 	if err != nil {
-		sendError(conn, err.Error())
-		return
+		return err
 	}
-	p := &binarygo.ListResponsePayload{
-		FileCount: uint16(len(names)),
-		FileNames: make([][]byte, 0, len(names)),
+
+	payload := &binarygo.ListResponsePayload{
+		FileCount: uint16(len(files)),
+		FileNames: make([][]byte, 0, len(files)),
 	}
-	for _, name := range names {
-		p.FileNames = append(p.FileNames, []byte(name))
+
+	for _, f := range files {
+		payload.FileNames = append(payload.FileNames, []byte(f))
 	}
-	bytes, _ := p.ToBytes()
+
+	bytes, err := payload.ToBytes()
+	if err != nil {
+		return err
+	}
+
 	sendSuccess(conn, bytes)
+	return nil
 }
 
 func sendSuccess(conn net.Conn, payload []byte) {
+
 	header := &binarygo.Header{
 		Version:    binarygo.PROTOCOL_VERSION,
 		Command:    0,
 		Status:     binarygo.CMD_SUCCESS,
 		PayloadLen: uint32(len(payload)),
 	}
+
 	hdr, _ := header.ToBytes()
+
 	conn.Write(hdr)
 	conn.Write(payload)
 }
 
 func sendError(conn net.Conn, msg string) {
+
 	resp := &binarygo.ResponseMessage{
 		MessageLen: uint16(len(msg)),
 		Message:    []byte(msg),
 	}
+
 	bytes, _ := resp.ToBytes()
 
 	header := &binarygo.Header{
@@ -173,7 +221,9 @@ func sendError(conn net.Conn, msg string) {
 		Status:     binarygo.CMD_ERROR,
 		PayloadLen: uint32(len(bytes)),
 	}
+
 	hdr, _ := header.ToBytes()
+
 	conn.Write(hdr)
 	conn.Write(bytes)
 }

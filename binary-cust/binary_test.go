@@ -34,7 +34,6 @@ func TestUploadPayloadRoundTrip(t *testing.T) {
 		FilenameLen: 8,
 		Filename:    []byte("test.txt"),
 		FileSize:    6,
-		FileData:    []byte("hello\n"),
 	}
 
 	data, err := original.ToBytes()
@@ -48,7 +47,6 @@ func TestUploadPayloadRoundTrip(t *testing.T) {
 	}
 
 	if !bytes.Equal(original.Filename, parsed.Filename) ||
-		!bytes.Equal(original.FileData, parsed.FileData) ||
 		original.FileSize != parsed.FileSize {
 		t.Errorf("upload payload mismatch")
 	}

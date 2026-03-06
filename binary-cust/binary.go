@@ -59,7 +59,6 @@ type UploadPayload struct {
 	FilenameLen uint16
 	Filename    []byte
 	FileSize    uint64
-	FileData    []byte
 }
 
 func (p *UploadPayload) ToBytes() ([]byte, error) {
@@ -74,9 +73,7 @@ func (p *UploadPayload) ToBytes() ([]byte, error) {
 	if err := binary.Write(buf, binary.BigEndian, p.FileSize); err != nil {
 		return nil, err
 	}
-	if _, err := buf.Write(p.FileData); err != nil {
-		return nil, err
-	}
+
 	return buf.Bytes(), nil
 }
 
@@ -96,10 +93,6 @@ func ReadUploadPayload(data []byte) (*UploadPayload, error) {
 	}
 	if u.FileSize > MAX_FILE_SIZE {
 		return nil, fmt.Errorf("file size %d exceeds max limit %d", u.FileSize, MAX_FILE_SIZE)
-	}
-	u.FileData = make([]byte, u.FileSize)
-	if _, err := buf.Read(u.FileData); err != nil {
-		return nil, err
 	}
 
 	return &u, nil
